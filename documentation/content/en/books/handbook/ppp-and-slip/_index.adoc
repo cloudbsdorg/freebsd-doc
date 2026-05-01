@@ -1440,9 +1440,37 @@ If CPU usage is consistently high, consider:
 
 === Example Configurations
 
+This section provides complete, production-ready configurations for common use cases. Each example includes the necessary configuration files, an explanation of what the settings do, and verification steps.
+
 ==== Basic Two-Worker Setup
 
-For dual-core systems or initial testing:
+*Purpose*: For dual-core systems, development environments, or initial testing. The governor is disabled to provide predictable, static behavior.
+
+*Architecture*:
+
+[source]
+....
+                            +------------------+
+                            |   pppoe_lb       |
+    DSLAM <-- Ethernet -->  |   (dispatcher)   |<---> Worker 0
+    em0                     |                  |<---> Worker 1
+                            +------------------+
+....
+
+*When to Use*:
+
+* Development and testing environments
+* Systems with exactly 2 CPU cores
+* When you want predictable, static worker counts
+* Initial deployment before moving to auto-scaling
+
+*When Not to Use*:
+
+* Production with >500 concurrent sessions
+* Variable or unpredictable load patterns
+* High-availability requirements
+
+*Configuration Files*:
 
 [.programlisting]
 ....
@@ -1450,13 +1478,113 @@ For dual-core systems or initial testing:
 pppoed_enable="YES"
 pppoed_flags="-L -w 2 em0"
 
-# /etc/sysctl.conf
+# /etc/sysctl.conf (optional)
+# Disable governor for predictable behavior
 net.graph.pppoe_lb.governor.enabled=0
+....
+
+*What Each Setting Does*:
+
+* `-L`: Enable multi-worker mode
+* `-w 2`: Start with exactly 2 workers
+* `governor.enabled=0`: Disable auto-scaling (static configuration)
+
+*Verification Steps*:
+
+[source,shell]
+....
+# 1. Check that pppoed is running with 2 workers
+$ sockstat | grep pppoed
+root     pppoed     1234  3  tcp4   *:2000                *:*
+root     pppoed     1235  3  tcp4   *:2000                *:*
+root     pppoed     1236  3  tcp4   *:2000                *:*
+
+# 2. Verify worker count
+$ sysctl net.graph.pppoe_lb.governor.current_workers
+net.graph.pppoe_lb.governor.current_workers: 2
+
+# 3. Check session distribution
+$ ngctl msg pppoe_lb:pppoed showworkers
+Worker Status:
+  Worker 0: ACTIVE (0 sessions, 1h uptime)
+  Worker 1: ACTIVE (0 sessions, 1h uptime)
+....
+
+*Expected Behavior*:
+
+* Sessions are distributed round-robin between workers 0 and 1
+* New sessions always go to the worker with fewer existing sessions
+* Workers never scale up or down automatically
+* If a worker crashes, it is not automatically replaced
+
+*Troubleshooting*:
+
+[source,shell]
+....
+# Problem: Only 1 worker showing
+$ sysctl net.graph.pppoe_lb.governor.current_workers
+net.graph.pppoe_lb.governor.current_workers: 1
+
+# Solution: Check if pppoed restarted; may need manual restart
+$ service pppoed restart
 ....
 
 ==== Auto-Scaling Production Setup
 
-For production with automatic scaling:
+*Purpose*: For production environments with variable load. The governor automatically adjusts worker count based on CPU utilization.
+
+*Architecture*:
+
+[source]
+....
+    +-----------+
+    |  Governor  |    <-- Monitors CPU every 5 seconds
+    |  (scaler)   |
+    +------+------+    scale up/down signals
+           |
+           v
+    +------------------+     +------------------+
+    |   pppoe_lb       |---->| Worker Pool      |
+    |   (dispatcher)   |     | (grows: 2 -> N)  |
+    +------------------+     | (shrinks: N -> 2)|
+                              +------------------+
+....
+
+*Governor State Machine*:
+
+[source]
+....
+CPU > 80%           CPU < 30%
+    |                    |
+    v                    v
++----------+       +----------+
+| SCALE UP | ----> | IDLE    |
++----------+       +----------+
+                      ^
+                      |
+               CPU < 30%
+               + cooldown
+               |
+               v
+         +----------+
+         |SCALE DOWN|
+         +----------+
+....
+
+*When to Use*:
+
+* Production environments with variable session counts
+* ISPs with peak usage hours (evening, weekends)
+* Systems where "set and forget" scaling is desired
+* Any deployment with fluctuating load patterns
+
+*When Not to Use*:
+
+* Predictable, constant load (use Basic Two-Worker Setup)
+* Very small systems with limited resources
+* Environments where frequent worker changes are disruptive
+
+*Configuration Files*:
 
 [.programlisting]
 ....
@@ -1465,19 +1593,181 @@ pppoed_enable="YES"
 pppoed_flags="-L -w 2 -G 0 em0"
 
 # /etc/sysctl.conf
-net.graph.pppoe_lb.governor.enabled=1
-net.graph.pppoe_lb.governor.mode=1
-net.graph.pppoe_lb.governor.min_workers=2
-net.graph.pppoe_lb.governor.max_workers=0
-net.graph.pppoe_lb.governor.cpu_threshold=80
-net.graph.pppoe_lb.governor.cpu_low_threshold=30
-net.graph.pppoe_lb.governor.scale_up_interval=10
-net.graph.pppoe_lb.governor.scale_down_interval=60
+# Governor settings
+net.graph.pppoe_lb.governor.enabled=1           # Enable governor
+net.graph.pppoe_lb.governor.mode=1              # 1=auto mode
+net.graph.pppoe_lb.governor.min_workers=2       # Never go below 2 workers
+net.graph.pppoe_lb.governor.max_workers=0        # 0=auto (use mp_ncpus)
+
+# Thresholds
+net.graph.pppoe_lb.governor.cpu_threshold=80     # Scale up at 80% CPU
+net.graph.pppoe_lb.governor.cpu_low_threshold=30  # Scale down at 30% CPU
+
+# Timing (seconds)
+net.graph.pppoe_lb.governor.scale_up_interval=10   # Min between scale-ups
+net.graph.pppoe_lb.governor.scale_down_interval=60  # Min between scale-downs
+net.graph.pppoe_lb.governor.drain_timeout=30       # Wait for drain before removal
+....
+
+*What Each Setting Does*:
+
+[cols="1,1,2", options="header"]
+|===
+|Setting |Default |Description
+|`governor.enabled=1` |0 |Enable automatic scaling
+|`governor.mode=1` |1 |Auto mode (vs manual mode)
+|`min_workers=2` |1 |Never scale below this count
+|`max_workers=0` |0 |0 means use `mp_ncpus` (CPU cores)
+|`cpu_threshold=80` |80 |Add worker when CPU exceeds this %
+|`cpu_low_threshold=30` |30 |Remove worker when CPU below this %
+|`scale_up_interval=10` |5 |Seconds between scale-up decisions
+|`scale_down_interval=60` |60 |Seconds between scale-down decisions
+|`drain_timeout=30` |30 |Seconds to wait for worker drain
+|===
+
+*Governor Scaling Behavior*:
+
+[source]
+....
+Timeline Example:
+
+Time    CPU     Workers  Event
+----    ---     -------  -----
+00:00   15%     2        Normal operation
+00:15   85%     2        Scale UP triggered!
+00:15   85%     3        Worker 2 created
+00:30   70%     3        Stabilized
+01:00   18%     3        Scale DOWN triggered!
+01:00   18%     3        Worker 2 marked DRAINING
+01:30   18%     2        Worker removed (drain complete)
+....
+
+*"Change of Heart" Scenario*:
+
+The governor can cancel a pending worker removal if load increases:
+
+[source]
+....
+Time    CPU     Workers  Event
+----    ---     -------  -----
+10:00   15%     3        Normal operation
+10:10   12%     3        Scale DOWN triggered
+10:10   12%     3        Worker 2 marked DRAINING
+10:25   85%     3        Traffic spike! (evening peak)
+10:25   85%     3        Scale UP needed - CANCEL DRAIN!
+10:25   85%     3        Worker 2 returns to ACTIVE
+10:25   85%     4        Worker 3 created (scale up)
+....
+
+*Verification Steps*:
+
+[source,shell]
+....
+# 1. Check governor is enabled and running
+$ sysctl net.graph.pppoe_lb.governor.enabled net.graph.pppoe_lb.governor.mode
+net.graph.pppoe_lb.governor.enabled: 1
+net.graph.pppoe_lb.governor.mode: 1
+
+# 2. View governor status
+$ ngctl msg pppoe_lb:pppoed showgovernor
+Governor Status:
+  Enabled: Yes
+  Mode: Auto
+  Min Workers: 2
+  Max Workers: 8
+  Current Workers: 3
+  Active Workers: 3
+  Draining Workers: 0
+  Pending Removals: 0
+  Last Decision: none
+
+# 3. Monitor for scaling events in logs
+$ tail -f /var/log/messages | grep pppoe_lb
+May  1 10:15:22 hostname ng_pppoe_lb: governor: scale up (reason: cpu_high)
+May  1 10:15:22 hostname ng_pppoe_lb: created worker 2 (now 3 workers)
+....
+
+*Expected Sysctl Output*:
+
+[source,shell]
+....
+$ sysctl net.graph.pppoe_lb.governor
+net.graph.pppoe_lb.governor.enabled: 1
+net.graph.pppoe_lb.governor.mode: 1
+net.graph.pppoe_lb.governor.min_workers: 2
+net.graph.pppoe_lb.governor.max_workers: 0
+net.graph.pppoe_lb.governor.cpu_threshold: 80
+net.graph.pppoe_lb.governor.cpu_low_threshold: 30
+net.graph.pppoe_lb.governor.scale_up_interval: 10
+net.graph.pppoe_lb.governor.scale_down_interval: 60
+net.graph.pppoe_lb.governor.current_workers: 3
+net.graph.pppoe_lb.governor.active_workers: 3
+net.graph.pppoe_lb.governor.draining_workers: 0
+net.graph.pppoe_lb.governor.total_sessions: 156
+net.graph.pppoe_lb.governor.last_decision: none
+net.graph.pppoe_lb.governor.last_reason: none
+....
+
+*Troubleshooting*:
+
+[source,shell]
+....
+# Problem: Governor not scaling up
+$ sysctl net.graph.pppoe_lb.governor.current_workers
+net.graph.pppoe_lb.governor.current_workers: 2
+
+# Check: Is governor enabled?
+$ sysctl net.graph.pppoe_lb.governor.enabled
+net.graph.pppoe_lb.governor.enabled: 0
+# Solution: Enable it
+$ sysctl net.graph.pppoe_lb.governor.enabled=1
+
+# Check: Is CPU actually high?
+$ sysctl net.graph.pppoe_lb.governor.cpu_usage
+net.graph.pppoe_lb.governor.cpu_usage: 45
+# CPU must exceed 80% (cpu_threshold) to scale up
+
+# Check: At maximum workers?
+$ sysctl net.graph.pppoe_lb.governor.max_workers
+net.graph.pppoe_lb.governor.max_workers: 0
+# 0 means mp_ncpus, check actual CPU count
+$ sysctl mp_ncpus
+mp_ncpus: 8
+# Currently at 2 workers, max is 8 - should be able to scale
 ....
 
 ==== High-Load Setup
 
-For high-volume PPPoE servers:
+*Purpose*: For high-volume PPPoE servers expecting thousands of concurrent sessions. Uses more aggressive scaling parameters and higher session-per-worker targets.
+
+*Architecture*:
+
+[source]
+....
+                            +------------------+
+                            |   pppoe_lb       |
+    DSLAM <-- Ethernet -->  |   (dispatcher)   |<---> Worker 0
+    em0                     |                  |<---> Worker 1
+                            |                  |<---> ...
+                            +------------------+<---> Worker 7
+
+    Expected Capacity: 8 workers x 1000 sessions = 8000 concurrent sessions
+....
+
+*When to Use*:
+
+* High-volume PPPoE servers (1000+ concurrent sessions)
+* ISPs with thousands of subscribers
+* Systems with dedicated high-performance hardware
+* When predictable high throughput is required
+
+*When Not to Use*:
+
+* Small deployments with <500 total sessions
+* Resource-constrained systems
+* Development or testing environments
+
+*Configuration Files*:
 
 [.programlisting]
 ....
@@ -1486,15 +1776,168 @@ pppoed_enable="YES"
 pppoed_flags="-L -w 8 -G 0 em0"
 
 # /etc/sysctl.conf
+# Governor settings
 net.graph.pppoe_lb.governor.enabled=1
 net.graph.pppoe_lb.governor.mode=1
-net.graph.pppoe_lb.governor.min_workers=4
-net.graph.pppoe_lb.governor.max_workers=0
-net.graph.pppoe_lb.governor.cpu_threshold=70
-net.graph.pppoe_lb.governor.cpu_low_threshold=40
-net.graph.pppoe_lb.governor.scale_up_interval=5
-net.graph.pppoe_lb.governor.scale_down_interval=120
-net.graph.pppoe_lb.governor.sess_per_worker=1000
+net.graph.pppoe_lb.governor.min_workers=4       # Higher minimum for production
+net.graph.pppoe_lb.governor.max_workers=0       # 0=auto (use mp_ncpus)
+
+# Thresholds (more aggressive)
+net.graph.pppoe_lb.governor.cpu_threshold=70     # Scale up earlier (70%)
+net.graph.pppoe_lb.governor.cpu_low_threshold=40 # Scale down later (40%)
+net.graph.pppoe_lb.governor.sess_per_worker=1000 # Target sessions per worker
+
+# Timing (faster response)
+net.graph.pppoe_lb.governor.scale_up_interval=5    # Faster scale-up (5s)
+net.graph.pppoe_lb.governor.scale_down_interval=120 # Slower scale-down (2min)
+net.graph.pppoe_lb.governor.drain_timeout=60        # Longer drain timeout
+....
+
+*What Changed from Production Setup*:
+
+[cols="1,1,1,2", options="header"]
+|===
+|Setting |Production |High-Load |Why Changed
+|`w` (workers) |2 |8 |More capacity
+|`min_workers` |2 |4 |Never drop below 4
+|`cpu_threshold` |80 |70 |Scale up earlier
+|`cpu_low_threshold` |30 |40 |Scale down later
+|`scale_up_interval` |10 |5 |Faster response
+|`scale_down_interval` |60 |120 |Slower scale-down
+|`drain_timeout` |30 |60 |Longer drain for high-load
+|`sess_per_worker` |500 |1000 |Higher session density
+|===
+
+*Capacity Estimates*:
+
+[source]
+....
+Worker Count     Sessions (500/worker)  Sessions (1000/worker)
+------------     ---------------------  ----------------------
+4 workers       2,000                  4,000
+8 workers       4,000                  8,000
+16 workers      8,000                  16,000
+
+Note: Actual capacity depends on:
+  - Available CPU cores (max_workers = mp_ncpus)
+  - Network interface throughput
+  - Traffic patterns (session vs. bandwidth)
+  - Available memory
+....
+
+*Verification Steps*:
+
+[source,shell]
+....
+# 1. Verify 8 workers started
+$ sysctl net.graph.pppoe_lb.governor.current_workers
+net.graph.pppoe_lb.governor.current_workers: 8
+
+# 2. Check per-worker session distribution
+$ for i in $(seq 0 7); do
+    echo -n "Worker $i: "
+    sysctl -n net.graph.pppoe_lb.workers.$i.sessions
+  done
+Worker 0: 134
+Worker 1: 142
+Worker 2: 128
+Worker 3: 156
+Worker 4: 139
+Worker 5: 147
+Worker 6: 131
+Worker 7: 125
+
+# 3. Verify balance (all should be within 20% of average)
+$ sysctl net.graph.pppoe_lb.governor.avg_sessions_worker
+net.graph.pppoe_lb.governor.avg_sessions_worker: 137
+
+# 4. Check for load imbalance warnings
+$ sysctl net.graph.pppoe_lb.health
+net.graph.pppoe_lb.health.load_imbalance_pct: 12
+# Values > 20% may indicate issues
+....
+
+*Performance Monitoring*:
+
+[source,shell]
+....
+# Monitor CPU usage per worker (top usage)
+top -b -n 1 | grep pppoed
+
+# Check total throughput
+$ netstat -I em0 -b | head -5
+
+# View per-worker statistics
+$ ngctl msg pppoe_lb:pppoed showstats
+
+# Check for errors
+$ sysctl net.graph.pppoe_lb.stats.total_errors
+....
+
+*Troubleshooting*:
+
+[source,shell]
+....
+# Problem: Uneven session distribution
+$ sysctl net.graph.pppoe_lb.workers.0.sessions
+net.graph.pppoe_lb.workers.0.sessions: 456
+$ sysctl net.graph.pppoe_lb.workers.1.sessions
+net.graph.pppoe_lb.workers.1.sessions: 45
+
+# Causes:
+# 1. Sessions have session affinity (same MAC -> same worker)
+# 2. Some workers are in DRAINING state
+# 3. Hash algorithm is distributing unevenly
+
+# Check for draining workers
+$ sysctl net.graph.pppoe_lb.governor.draining_workers
+net.graph.pppoe_lb.governor.draining_workers: 1
+# Worker 1 might be draining!
+
+# Solution: Check worker states
+for i in $(seq 0 7); do
+  echo "Worker $i: $(sysctl -n net.graph.pppoe_lb.workers.$i.state)"
+done
+Worker 0: 0 (ACTIVE)
+Worker 1: 1 (DRAINING)  <-- This worker won't get new sessions
+Worker 2: 0 (ACTIVE)
+...
+
+# To cancel draining:
+$ sysctl net.graph.pppoe_lb.workers.1.state=0
+....
+
+==== Choosing a Configuration
+
+Use this decision guide to select the appropriate configuration:
+
+[cols="1,2,2,2", options="header"]
+|===
+|Scenario |Basic |Auto-Scaling |High-Load
+|CPU cores |2 |4+ |8+
+|Expected sessions |<500 |100-2000 |1000-8000+
+|Load pattern |Constant |Variable |High/Variable
+|Scaling needs |None |Automatic |Automatic
+|Monitoring |Manual |Governor |Governor
+|Startup time |Fast |Medium |Slow
+|Resource usage |Low |Medium |High
+|===
+
+*Transitioning Between Configurations*:
+
+You can safely transition between configurations:
+
+[source,shell]
+....
+# 1. Start with Basic (testing)
+# 2. Move to Auto-Scaling when ready for production
+# 3. Move to High-Load if capacity is exceeded
+
+# To change configuration:
+# 1. Edit /etc/sysctl.conf with new settings
+# 2. Apply new sysctls: sysctl -f /etc/sysctl.conf
+# 3. Adjust worker count: ngctl msg pppoe_lb:pppoed setworkers N
+# 4. Or restart pppoed: service pppoed restart
 ....
 
 === See Also
