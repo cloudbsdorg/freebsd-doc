@@ -1940,6 +1940,388 @@ You can safely transition between configurations:
 # 4. Or restart pppoed: service pppoed restart
 ....
 
+=== pppoetest - Testing and Diagnostic Tool
+
+The `pppoetest` tool provides comprehensive testing and diagnostic capabilities for the PPPoE load balancer. It can operate in diagnostic mode (observe existing connections) or create mode (generate test traffic).
+
+==== Overview
+
+`pppoetest` is designed for:
+
+* *Diagnostic mode*: Safely observe production systems without creating sessions
+* *Accuracy testing*: Verify session distribution and affinity
+* *Transfer testing*: Test file transfers with checksums
+* *Governor testing*: Verify auto-scaling behavior
+
+*Key features*:
+
+* No external dependencies (part of FreeBSD base system)
+* Client-server architecture for distributed testing
+* JSONL output for integration with monitoring systems
+* Production-safe diagnostic mode (read-only by default)
+
+==== Installation
+
+`pppoetest` is built as part of the FreeBSD base system:
+
+[source,shell]
+....
+# Build the tool
+$ cd /usr/src/usr.sbin/pppoetest
+$ make
+$ make install
+
+# Verify installation
+$ which pppoetest
+/usr/sbin/pppoetest
+....
+
+==== Modes of Operation
+
+[cols="1,1,3", options="header"]
+|===
+|Mode |Flag |Description
+|Diagnose |`-m diagnose` |Passive observation of existing sessions (default)
+|Create |`-m create` |Actively create test sessions
+|Mixed |`-m mixed` |Observe existing and create new sessions
+|Server |`-m server` |Run as server for remote client testing
+|Client |`-m client` |Connect to server for distributed testing
+|===
+
+==== Diagnostic Mode (Default)
+
+Diagnostic mode is safe to run on production systems - it never creates sessions:
+
+[source,shell]
+....
+# Basic diagnostics (read-only, safe for production)
+$ pppoetest -m diagnose
+
+PPPoE Load Balancer Diagnostic Report
+=====================================
+Host: pppoe-server.example.com
+Time: 2024-05-01 10:15:22 UTC
+
+Workers: 3
+  Worker 0: ACTIVE (234 sessions, 45m uptime)
+  Worker 1: ACTIVE (256 sessions, 45m uptime)
+  Worker 2: DRAINING (12 sessions, 10m uptime)
+
+Sessions: 502 total
+  Active: 490
+  Draining: 12
+
+Governor: Enabled
+  CPU: 52%
+  Last Decision: none
+
+Health Score: 87/100 ✓
+....
+
+==== Health Checks
+
+Run comprehensive health checks on the load balancer:
+
+[source,shell]
+....
+# Check health score
+$ pppoetest -m diagnose --health-score
+
+=== PPPoE Load Balancer Health Score: 87/100 ===
+
+Component Scores:
+  ✓ Worker Availability: 100/100
+  ⚠ Load Distribution:   72/100 (max deviation: 28%)
+  ✓ Error Rate:           100/100
+  ✓ Session Affinity:     99/100 (1 drift detected)
+
+Warnings:
+  - Load distribution uneven (Worker 0 has 28% more than average)
+  - 1 session affinity drift detected
+
+Recommendations:
+  - Investigate Worker 0 for potential issues
+  - Check for sessions that moved between workers unexpectedly
+....
+
+*Health Score Interpretation*:
+
+[cols="1,1,2", options="header"]
+|===
+|Score |Status |Meaning
+|90-100 |PASS |Healthy, no action needed
+|70-89 |WARN |Minor issues, monitor closely
+|50-69 |FAIL |Significant problems, investigate
+|0-49 |CRITICAL |Immediate attention required
+|===
+
+==== Load Balance Check
+
+Check if sessions are evenly distributed:
+
+[source,shell]
+....
+$ pppoetest -m diagnose --check-balance
+
+=== Load Balance Check ===
+┌────────┬───────────┬──────────┬────────────────┐
+│ Worker │ Sessions  │ Expected │ Deviation      │
+├────────┼───────────┼──────────┼────────────────┤
+│ 0      │ 234       │ 200     │ +17% ⚠         │
+│ 1      │ 256       │ 200     │ +28% ⚠         │
+│ 2      │ 112       │ 200     │ -44% ⚠         │
+└────────┴───────────┴──────────┴────────────────┘
+
+Imbalance: 28% (threshold: 20%)
+Status: ⚠ WARNING - Load distribution exceeds threshold
+
+Recommendations:
+  - Worker 2 may be in DRAINING state
+  - Check worker states: sysctl net.graph.pppoe_lb.workers.*.state
+....
+
+==== Session Affinity Check
+
+Verify sessions stay on their assigned workers:
+
+[source,shell]
+....
+$ pppoetest -m diagnose --check-affinity
+
+=== Affinity Check ===
+┌────────────┬────────────────┬─────────────────┬────────────┐
+│ Session ID │ Expected Worker│ Actual Worker  │ Status     │
+├────────────┼────────────────┼─────────────────┼────────────┤
+│ 0x7f3a2b  │ 2              │ 2               │ ✓ OK       │
+│ 0x8c4d1e  │ 1              │ 1               │ ✓ OK       │
+│ 0x9a1f7c  │ 3              │ 2 ⚠             │ ✗ DRIFT    │
+└────────────┴────────────────┴─────────────────┴────────────┘
+
+Total: 3 sessions checked
+  ✓ Passed: 2
+  ✗ Failed: 1 (session drift detected)
+
+Session drift may indicate:
+  - Worker was removed while session was active
+  - Hash algorithm rebalancing
+  - Race condition in session routing
+....
+
+==== Worker State Check
+
+View detailed worker status:
+
+[source,shell]
+....
+$ pppoetest -m diagnose --show-workers
+
+=== Worker Status ===
+┌────────┬─────────┬──────────┬───────────┬───────────┬──────────┐
+│ Worker │ State   │ Sessions │ Bytes In  │ Bytes Out │ Uptime   │
+├────────┼─────────┼──────────┼───────────┼───────────┼──────────┤
+│ 0      │ ACTIVE  │ 234      │ 1.2 GB    │ 456 MB    │ 45m      │
+│ 1      │ ACTIVE  │ 256      │ 1.4 GB    │ 523 MB    │ 45m      │
+│ 2      │ DRAINING│ 12       │ 89 MB     │ 34 MB     │ 10m      │
+└────────┴─────────┴──────────┴───────────┴───────────┴──────────┘
+
+Worker States:
+  0 = ACTIVE (accepting new sessions)
+  1 = DRAINING (completing existing sessions)
+  2 = PENDING_REMOVAL (ready for removal)
+....
+
+==== Real-Time Monitoring
+
+Monitor the load balancer continuously:
+
+[source,shell]
+....
+# Monitor every 5 seconds
+$ pppoetest -m diagnose --monitor --interval 5
+
+Press Ctrl+C to stop
+
+┌──────────────────────────┬────────┬────────┬────────┬────────┐
+│ Metric                   │ Now    │ 5s ago │ 30s ago│ 5m ago │
+├──────────────────────────┼────────┼────────┼────────┼────────┤
+│ Total Sessions           │ 800    │ 798    │ 785    │ 750    │
+│ Active Workers           │ 3      │ 3      │ 3      │ 2      │
+│ Sessions/Worker (avg)   │ 267    │ 266    │ 262    │ 375    │
+│ CPU Usage (avg)        │ 52%    │ 48%    │ 45%    │ 38%    │
+└──────────────────────────┴────────┴────────┴────────┴────────┘
+
+Changes detected:
+  ↑ Workers: 2 -> 3 (governor scaled up)
+  ↑ Sessions: 750 -> 800 (+50 in 5 minutes)
+....
+
+==== Client-Server Mode
+
+For distributed testing across multiple systems:
+
+*Server* (test coordinator):
+[source,shell]
+....
+# Start server on test coordinator
+$ pppoetest -m server -i em0 -p 9001
+
+Server listening on port 9001
+Waiting for client connections...
+....
+
+*Client* (test initiator):
+[source,shell]
+....
+# Connect to server and run tests
+$ pppoetest -m client -h test-coordinator.example.com -p 9001
+
+Connected to test-coordinator.example.com:9001
+Running accuracy test...
+....
+
+*When both sides are connected*:
+[source,shell]
+....
+Both sides will see coordinated test results:
+
+┌─────────────────┐    ┌─────────────────┐
+│   CLIENT SIDE   │    │   SERVER SIDE   │
+│ Blocks: 800     │    │ Blocks: 800    │
+│ Checksum: OK    │    │ Checksum: OK    │
+└─────────────────┘    └─────────────────┘
+        ↓                      ↓
+   VERIFICATION (MATCH/MISMATCH)
+
+✓ Transfer test PASSED
+  - 800 blocks transferred
+  - Checksums match on both sides
+....
+
+==== Output Formats
+
+`pppoetest` supports multiple output formats for integration with other tools:
+
+[source,shell]
+....
+# Console output (default)
+$ pppoetest -m diagnose --format console
+
+# JSON output (for parsing)
+$ pppoetest -m diagnose --format json
+{
+  "type": "diagnostic_report",
+  "timestamp": "2024-05-01T10:15:22Z",
+  "workers": 3,
+  "sessions": 502,
+  "health_score": 87,
+  "status": "warn"
+}
+
+# JSONL output (streaming, for log processors)
+$ pppoetest -m diagnose --format jsonl
+{"type":"worker_status","id":0,"state":"ACTIVE","sessions":234}
+{"type":"worker_status","id":1,"state":"ACTIVE","sessions":256}
+{"type":"health_score","score":87,"status":"warn"}
+
+# CSV output (for spreadsheets)
+$ pppoetest -m diagnose --format csv
+worker_id,state,sessions,bytes_in,bytes_out
+0,ACTIVE,234,1288490188,478150656
+1,ACTIVE,256,1503238553,548453324
+2,DRAINING,12,95787918,36372403
+
+# TAP output (for test frameworks)
+$ pppoetest -m diagnose --format tap
+1..4
+ok 1 - Worker 0 is ACTIVE
+ok 2 - Worker 1 is ACTIVE
+ok 3 - Worker 2 is DRAINING
+ok 4 - Health score >= 70
+....
+
+==== Configuration Options
+
+Key command-line options:
+
+[cols="1,1,2", options="header"]
+|===
+|Option |Default |Description
+|`-m mode` |diagnose |Operation mode
+|`-i iface` |em0 |Network interface
+|`-h host` |localhost |Server hostname (client mode)
+|`-p port` |9001 |Control port
+|`-f format` |console |Output format
+|`--interval N` |5 |Monitoring interval (seconds)
+|`--balance-threshold N` |20 |Imbalance warning threshold (%)
+|`--health-threshold N` |40 |Health error threshold (%)
+|`--no-color` |false |Disable colored output
+|===
+
+==== Exit Codes
+
+[cols="1,2", options="header"]
+|===
+|Code |Meaning
+|0 |Success, all tests passed
+|1 |One or more tests failed
+|2 |Usage error (invalid arguments)
+|3 |Connection error (server unreachable)
+|4 |Timeout waiting for response
+|5 |Internal error
+|===
+
+==== Examples
+
+===== Basic Diagnostic
+
+Check system health without creating traffic:
+
+[source,shell]
+....
+$ pppoetest -m diagnose
+....
+
+===== Check Balance
+
+Verify session distribution is within tolerance:
+
+[source,shell]
+....
+$ pppoetest -m diagnose --check-balance --balance-threshold 15
+# Will warn if deviation exceeds 15%
+....
+
+===== Continuous Monitoring
+
+Monitor system with 2-second intervals:
+
+[source,shell]
+....
+$ pppoetest -m diagnose --monitor --interval 2
+# Press Ctrl+C to stop
+....
+
+===== Remote Diagnostic
+
+Diagnose a remote system:
+
+[source,shell]
+....
+$ pppoetest -m diagnose -h pppoe-server.example.com
+....
+
+===== JSONL for Logstash
+
+Stream diagnostics to a log processor:
+
+[source,shell]
+....
+$ pppoetest -m diagnose --format jsonl | jq .
+{"type":"worker_status","id":0,"state":"ACTIVE","sessions":234,"timestamp":"..."}
+{"type":"worker_status","id":1,"state":"ACTIVE","sessions":256,"timestamp":"..."}
+{"type":"health_score","score":87,"status":"warn","timestamp":"..."}
+....
+
 === See Also
 
 * man:ngctl[8] - Netgraph control utility
