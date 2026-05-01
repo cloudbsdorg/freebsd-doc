@@ -941,3 +941,565 @@ tun0: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500
 
 If the connection fails, check the configuration of the router, which is usually accessible using a web browser.
 Also, examine the output of `pptp` and the contents of the log file, [.filename]#/var/log/ppp.log# for clues.
+
+[[pppoe-lb]]
+== Multi-Worker PPPoE Load Balancer
+
+FreeBSD includes a multi-worker PPPoE load balancer that distributes PPPoE sessions across multiple workers for improved performance and scalability. This feature uses the `ng_pppoe_lb` netgraph node type and `pppoed` daemon with built-in auto-scaling capabilities.
+
+This section describes how to configure and use the multi-worker PPPoE load balancer.
+
+=== Overview
+
+The multi-worker PPPoE load balancer consists of:
+
+* *Kernel module* (`ng_pppoe_lb.ko`): Provides the netgraph node type for session distribution
+* *pppoed daemon*: Manages worker processes and implements the auto-scaling governor
+* *ngctl commands*: Administrative interface for monitoring and control
+* *Automatic CPU governor*: Dynamically scales workers based on system load
+
+Key features:
+
+* Distributes PPPoE sessions across multiple worker processes
+* Session affinity: sessions stay on the same worker for their lifetime
+* Built-in auto-scaling governor that adjusts worker count based on CPU usage
+* Session-aware worker management: draining workers stop receiving new sessions
+* No external dependencies (part of FreeBSD base system)
+
+=== Kernel Module Configuration
+
+Load the required kernel modules:
+
+[source,shell]
+....
+# kldload netgraph
+# kldload ng_ether
+# kldload ng_pppoe
+# kldload ng_pppoe_lb
+....
+
+To load these modules automatically at boot, add to [.filename]#/boot/loader.conf#:
+
+[.programlisting]
+....
+netgraph_load="YES"
+ng_ether_load="YES"
+ng_pppoe_load="YES"
+ng_pppoe_lb_load="YES"
+....
+
+=== Basic Configuration
+
+==== Creating the Load Balancer Node
+
+Create a PPPoE load balancer node using man:ngctl[8]:
+
+[source,shell]
+....
+# ngctl -f- <<EOF
+mkpeer pppoe lb lower pppoe_lb
+name pppoe_lb:pppoed
+msg pppoe_lb:pppoed setconfig ${ethernet_iface}
+EOF
+....
+
+Where _${ethernet_iface}_ is the Ethernet interface connected to the DSLAM (e.g., `em0`).
+
+==== Starting pppoed with Multiple Workers
+
+Start the pppoed daemon with multiple workers:
+
+[source,shell]
+....
+# pppoed -L -w 4 em0
+....
+
+This starts pppoed with 4 workers listening on interface `em0`.
+
+Command line options:
+
+* `-L`: Enable multi-worker mode
+* `-w count`: Number of worker processes (default: 1)
+* `-a address`: PPPoE access concentrator name (optional)
+* `-p profile`: Service name (optional)
+
+==== rc.conf Configuration
+
+Add to [.filename]#/etc/rc.conf#:
+
+[.programlisting]
+....
+pppoed_enable="YES"
+pppoed_flags="-L -w 4 em0"
+pppoed_ng_pppae_lb_enable="YES"
+....
+
+=== Auto-Scaling Governor
+
+The built-in governor automatically adjusts the number of workers based on CPU usage.
+
+==== Enabling the Governor
+
+Enable the governor at runtime:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.enabled=1
+....
+
+Or configure in [.filename]#/etc/sysctl.conf#:
+
+[.programlisting]
+....
+net.graph.pppoe_lb.governor.enabled=1
+....
+
+==== Governor Configuration
+
+The governor can be configured via sysctl:
+
+[.programlisting]
+....
+# Governor settings
+net.graph.pppoe_lb.governor.enabled=1           # Enable governor
+net.graph.pppoe_lb.governor.mode=1              # 0=manual, 1=auto
+net.graph.pppoe_lb.governor.min_workers=2       # Minimum workers
+net.graph.pppoe_lb.governor.max_workers=0       # 0=auto (use mp_ncpus)
+
+# Thresholds
+net.graph.pppoe_lb.governor.cpu_threshold=80     # Scale up at 80% CPU
+net.graph.pppoe_lb.governor.cpu_low_threshold=30 # Scale down at 30% CPU
+
+# Timing
+net.graph.pppoe_lb.governor.scale_up_interval=10   # Seconds between scale-up
+net.graph.pppoe_lb.governor.scale_down_interval=60 # Seconds between scale-down
+net.graph.pppoe_lb.governor.drain_timeout=30      # Seconds to drain worker
+....
+
+==== Governor Behavior
+
+The governor monitors CPU usage and automatically scales workers:
+
+* *Scale up*: When CPU usage exceeds `cpu_threshold` (default 80%), a new worker is created
+* *Scale down*: When CPU usage falls below `cpu_low_threshold` (default 30%), a worker is marked for removal
+* *Session awareness*: Workers marked for removal stop receiving new sessions but keep existing sessions
+* *Change of heart*: If load increases before a worker is removed, the removal is canceled
+
+==== Worker States
+
+Workers can be in one of three states:
+
+* `ACTIVE`: Accepting new sessions, processing packets normally
+* `DRAINING`: No new sessions assigned, existing sessions complete naturally
+* `PENDING_REMOVAL`: Empty, ready for removal
+
+View worker states:
+
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed showworkers
+....
+
+Or via sysctl:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.workers
+....
+
+=== Monitoring
+
+==== Using ngctl
+
+View load balancer status:
+
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed showworkers
+Worker Status:
+  Worker 0: ACTIVE (23 sessions, 45m uptime)
+  Worker 1: ACTIVE (31 sessions, 45m uptime)
+  Worker 2: DRAINING (5 sessions, 10m uptime)
+  Worker 3: ACTIVE (28 sessions, 45m uptime)
+....
+
+View governor status:
+
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed showgovernor
+Governor Status:
+  Enabled: Yes
+  Mode: Auto
+  Min Workers: 2
+  Max Workers: 4
+  Current Workers: 3
+  Active Workers: 2
+  Draining Workers: 1
+  Pending Removals: 0
+  Last Decision: scale_down (reason: cpu_low)
+....
+
+==== Using sysctl
+
+View all PPPoE load balancer sysctls:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb
+....
+
+Key sysctls:
+
+* `net.graph.pppoe_lb.governor.enabled`: Enable/disable governor
+* `net.graph.pppoe_lb.governor.current_workers`: Current number of workers
+* `net.graph.pppoe_lb.governor.active_workers`: Workers in ACTIVE state
+* `net.graph.pppoe_lb.governor.total_sessions`: Total active sessions
+* `net.graph.pppoe_lb.governor.cpu_usage`: Current CPU usage percentage
+* `net.graph.pppoe_lb.governor.last_decision`: Last scaling decision
+
+==== Per-Worker Statistics
+
+View per-worker statistics:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.workers.0
+net.graph.pppoe_lb.workers.0.state: 0
+net.graph.pppoe_lb.workers.0.sessions: 23
+net.graph.pppoe_lb.workers.0.bytes_in: 1234567890
+net.graph.pppoe_lb.workers.0.bytes_out: 987654321
+net.graph.pppoe_lb.workers.0.uptime: 2700
+....
+
+=== Manual Worker Management
+
+==== Adding a Worker
+
+Add a worker manually:
+
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed addworker
+....
+
+Or via sysctl:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.desired_workers=5
+....
+
+==== Removing a Worker
+
+Mark a worker for removal (draining):
+
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed rmworker 2
+....
+
+Or set worker state directly:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.workers.2.state=1
+....
+
+The worker will stop receiving new sessions and be removed when empty.
+
+==== Canceling Worker Removal
+
+If a worker is draining but load increases, cancel the removal:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.workers.2.state=0
+....
+
+The worker returns to ACTIVE state and can receive new sessions.
+
+=== Session Affinity
+
+The load balancer maintains session affinity: once a session is assigned to a worker, it stays on that worker.
+
+==== How Affinity Works
+
+When a new PPPoE session arrives:
+
+. The load balancer receives the PADI packet
+. It selects a worker using the configured algorithm
+. The session is created on that worker
+. All subsequent packets for that session go to the same worker
+
+==== Affinity Algorithms
+
+Configure the session distribution algorithm:
+
+[source,shell]
+....
+# Round-robin (default)
+# ngctl msg pppoe_lb:pppoed setalgorithm 0
+
+# Hash-based (by source MAC)
+# ngctl msg pppoe_lb:pppoed setalgorithm 1
+
+# Least-loaded (fewest sessions)
+# ngctl msg pppoe_lb:pppoed setalgorithm 2
+....
+
+==== Viewing Session Mappings
+
+View which worker a session is on:
+
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed getmap
+Session Mappings:
+  Session 0x7f3a2b: Worker 2
+  Session 0x8c4d1e: Worker 1
+  Session 0x9a1f7c: Worker 3
+....
+
+=== Troubleshooting
+
+==== Governor Not Scaling Up
+
+If the governor doesn't scale up when expected:
+
+. Verify governor is enabled:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.enabled
+....
++
+Should return `1`.
+
+. Check current CPU usage:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.cpu_usage
+....
++
+CPU must exceed `cpu_threshold` to trigger scale-up.
+
+. Check worker count isn't at maximum:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.max_workers
+....
++
+If set to `0`, maximum is `mp_ncpus`. If already at maximum, governor cannot add more.
+
+==== Governor Not Scaling Down
+
+If the governor doesn't scale down:
+
+. Verify workers are draining:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.draining_workers
+....
++
+Must be greater than `0` for scale-down to complete.
+
+. Check scale-down interval hasn't elapsed:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.scale_down_interval
+....
++
+Default is 60 seconds. Governor waits this long between scale-down decisions.
+
+. Verify workers have few sessions:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.avg_sessions_worker
+....
++
+CPU must be below `cpu_low_threshold` for scale-down.
+
+==== Sessions Not Distributing Evenly
+
+If sessions aren't balanced across workers:
+
+. Check for affinity issues:
++
+Sessions from the same MAC always go to the same worker (hash algorithm).
+
+. Verify worker states:
++
+Workers in DRAINING state don't receive new sessions:
++
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.draining_workers
+....
+
+. Check for stuck sessions:
++
+Some sessions may not disconnect, preventing worker removal:
++
+[source,shell]
+....
+# ngctl msg pppoe_lb:pppoed showworkers
+....
+
+==== Kernel Module Not Loading
+
+If `ng_pppoe_lb` fails to load:
+
+. Verify the module exists:
++
+[source,shell]
+....
+# ls /boot/kernel/ng_pppoe_lb.ko
+....
+
+. Check for dependency errors:
++
+[source,shell]
+....
+# kldload ng_pppoe_lb
+....
++
+Look for missing dependency messages.
+
+==== pppoed Won't Start
+
+If pppoed fails to start:
+
+. Check for port conflicts:
++
+[source,shell]
+....
+# sockstat | grep pppoed
+....
+
+. Verify ng_pppoe_lb node exists:
++
+[source,shell]
+....
+# ngctl list | grep pppoe
+....
+
+. Check logs:
++
+[source,shell]
+....
+# tail -f /var/log/messages | grep pppoed
+....
+
+=== Performance Tuning
+
+==== Number of Workers
+
+The optimal number of workers depends on:
+
+* *CPU cores*: Each worker can use one CPU core
+* *Expected sessions*: 500 sessions per worker is a reasonable target
+* *Traffic volume*: CPU-intensive tasks benefit from more workers
+
+Starting values:
+
+* For testing: 2 workers
+* For production: Match `mp_ncpus` or slightly less
+* For high-load: `mp_ncpus * 1.5` (if governor is enabled)
+
+==== CPU Thresholds
+
+Tune governor thresholds based on workload:
+
+* *CPU threshold* (scale up): Lower values (e.g., 60%) scale up earlier
+* *CPU low threshold* (scale down): Higher values (e.g., 40%) scale down later
+
+More aggressive scaling (lower thresholds) provides better performance but may create/destroy workers more frequently.
+
+==== Monitoring Performance
+
+Monitor system performance:
+
+[source,shell]
+....
+# sysctl net.graph.pppoe_lb.governor.cpu_usage net.graph.pppoe_lb.governor.total_sessions
+net.graph.pppoe_lb.governor.cpu_usage: 67
+net.graph.pppoe_lb.governor.total_sessions: 847
+....
+
+If CPU usage is consistently high, consider:
+
+* Increasing the number of workers
+* Adding more CPU cores
+* Offloading some sessions to another server
+
+=== Example Configurations
+
+==== Basic Two-Worker Setup
+
+For dual-core systems or initial testing:
+
+[.programlisting]
+....
+# /etc/rc.conf
+pppoed_enable="YES"
+pppoed_flags="-L -w 2 em0"
+
+# /etc/sysctl.conf
+net.graph.pppoe_lb.governor.enabled=0
+....
+
+==== Auto-Scaling Production Setup
+
+For production with automatic scaling:
+
+[.programlisting]
+....
+# /etc/rc.conf
+pppoed_enable="YES"
+pppoed_flags="-L -w 2 -G 0 em0"
+
+# /etc/sysctl.conf
+net.graph.pppoe_lb.governor.enabled=1
+net.graph.pppoe_lb.governor.mode=1
+net.graph.pppoe_lb.governor.min_workers=2
+net.graph.pppoe_lb.governor.max_workers=0
+net.graph.pppoe_lb.governor.cpu_threshold=80
+net.graph.pppoe_lb.governor.cpu_low_threshold=30
+net.graph.pppoe_lb.governor.scale_up_interval=10
+net.graph.pppoe_lb.governor.scale_down_interval=60
+....
+
+==== High-Load Setup
+
+For high-volume PPPoE servers:
+
+[.programlisting]
+....
+# /etc/rc.conf
+pppoed_enable="YES"
+pppoed_flags="-L -w 8 -G 0 em0"
+
+# /etc/sysctl.conf
+net.graph.pppoe_lb.governor.enabled=1
+net.graph.pppoe_lb.governor.mode=1
+net.graph.pppoe_lb.governor.min_workers=4
+net.graph.pppoe_lb.governor.max_workers=0
+net.graph.pppoe_lb.governor.cpu_threshold=70
+net.graph.pppoe_lb.governor.cpu_low_threshold=40
+net.graph.pppoe_lb.governor.scale_up_interval=5
+net.graph.pppoe_lb.governor.scale_down_interval=120
+net.graph.pppoe_lb.governor.sess_per_worker=1000
+....
+
+=== See Also
+
+* man:ngctl[8] - Netgraph control utility
+* man:pppoed[8] - PPPoE daemon
+* man:sysctl[8] - Get or set kernel state
+* man:ng_pppoe[4] - PPPoE netgraph node type
